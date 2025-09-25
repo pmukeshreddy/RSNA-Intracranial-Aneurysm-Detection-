@@ -103,19 +103,21 @@ class AneurysmDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # Load data
         volume, labels = self._load_data(idx)
-
+        
         # Handle 2D vs 3D processing
         if self.use_2d:
             if volume.ndim == 4:
                 volume = self._extract_slice(volume)
         else:
-            # Handle variable depth sizes for 3D
+            # Handle variable sizes for 3D - resize ALL dimensions
             if volume.ndim == 4 and volume.shape[0] == 3:
                 C, D, H, W = volume.shape
                 target_depth = 128
-
+                target_height = 256
+                target_width = 256
+                
+                # Handle Depth dimension
                 if D != target_depth:
-                    # Resize depth dimension to consistent size
                     if D > target_depth:
                         # Crop: take center slices
                         start_idx = (D - target_depth) // 2
@@ -125,29 +127,98 @@ class AneurysmDataset(Dataset):
                         pad_needed = target_depth - D
                         pad_before = pad_needed // 2
                         pad_after = pad_needed - pad_before
-
-                        # Pad along depth dimension (dim=1)
-                        volume = np.pad(volume, ((0, 0), (pad_before, pad_after), (0, 0), (0, 0)), mode='constant', constant_values=0)
-
+                        volume = np.pad(
+                            volume,
+                            ((0, 0), (pad_before, pad_after), (0, 0), (0, 0)),
+                            mode='constant',
+                            constant_values=0
+                        )
+                
+                # Update dimensions after depth processing
+                C, D, H, W = volume.shape
+                
+                # Handle Height dimension
+                if H != target_height:
+                    if H > target_height:
+                        # Crop: take center
+                        start_idx = (H - target_height) // 2
+                        volume = volume[:, :, start_idx:start_idx + target_height, :]
+                    else:
+                        # Pad: add zeros
+                        pad_needed = target_height - H
+                        pad_before = pad_needed // 2
+                        pad_after = pad_needed - pad_before
+                        volume = np.pad(
+                            volume,
+                            ((0, 0), (0, 0), (pad_before, pad_after), (0, 0)),
+                            mode='constant',
+                            constant_values=0
+                        )
+                
+                # Update dimensions after height processing
+                C, D, H, W = volume.shape
+                
+                # Handle Width dimension
+                if W != target_width:
+                    if W > target_width:
+                        # Crop: take center
+                        start_idx = (W - target_width) // 2
+                        volume = volume[:, :, :, start_idx:start_idx + target_width]
+                    else:
+                        # Pad: add zeros
+                        pad_needed = target_width - W
+                        pad_before = pad_needed // 2
+                        pad_after = pad_needed - pad_before
+                        volume = np.pad(
+                            volume,
+                            ((0, 0), (0, 0), (0, 0), (pad_before, pad_after)),
+                            mode='constant',
+                            constant_values=0
+                        )
+            
             else:
-                # Fallback: reshape to expected size
-                volume = volume.reshape(3, 128, 256, 256)
-
+                # Fallback: force resize to expected size (may distort data)
+                print(f"Warning: Unexpected shape at index {idx}, forcing resize")
+                temp_tensor = torch.tensor(volume, dtype=torch.float32)
+                if temp_tensor.ndim == 3:
+                    temp_tensor = temp_tensor.unsqueeze(0)  # Add channel dim
+                if temp_tensor.ndim == 4:
+                    # Ensure we have 3 channels
+                    if temp_tensor.shape[0] < 3:
+                        padding = torch.zeros(3 - temp_tensor.shape[0], *temp_tensor.shape[1:], dtype=torch.float32)
+                        temp_tensor = torch.cat([temp_tensor, padding], dim=0)
+                    elif temp_tensor.shape[0] > 3:
+                        temp_tensor = temp_tensor[:3]
+                        
+                    # Resize spatial dimensions using interpolation
+                    temp_tensor = temp_tensor.unsqueeze(0)  # Add batch dim for interpolate
+                    temp_tensor = torch.nn.functional.interpolate(
+                        temp_tensor, size=(128, 256, 256), mode='trilinear', align_corners=False
+                    )
+                    volume = temp_tensor.squeeze(0).numpy()  # Remove batch dim
+        
         # Clean tensor creation
         volume_array = np.array(volume, dtype=np.float32, copy=True)
         labels_array = np.array(labels, dtype=np.float32, copy=True)
-
+        
         X = torch.tensor(volume_array, dtype=torch.float32)
         Y = torch.tensor(labels_array, dtype=torch.float32)
-
+        
         # Verify final shape for 3D
         if not self.use_2d:
-            assert X.shape == (3, 128, 256, 256), f"Unexpected shape: {X.shape} at index {idx}"
-
+            if X.shape != (3, 128, 256, 256):
+                print(f"Shape mismatch at index {idx}: {X.shape}")
+                # Final fallback - use interpolation
+                X = X.unsqueeze(0)
+                X = torch.nn.functional.interpolate(
+                    X, size=(128, 256, 256), mode='trilinear', align_corners=False
+                )
+                X = X.squeeze(0)
+        
         # Apply transforms if needed
         if self.transform:
             X = self.transform(X)
-
+        
         return X, Y
 
     def _extract_slice(self, volume: np.ndarray) -> np.ndarray:
