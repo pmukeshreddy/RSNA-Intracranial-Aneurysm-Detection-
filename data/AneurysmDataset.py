@@ -1,4 +1,3 @@
-
 class AneurysmDataset(Dataset):
     def __init__(self, npz_dir, train_df, fold, is_training, use_2d, slice_selection, cache_data, transform=None):
         self.npz_dir = Path(npz_dir)
@@ -55,7 +54,25 @@ class AneurysmDataset(Dataset):
             data = np.load(npz_path, allow_pickle=True)
 
             # Get volume
-            volume = data['final_input'].astype(np.float32)
+            possible_keys = ['final_input', 'data', 'volume', 'image', 'array']
+
+            volume = None
+
+            available_keys = list(data.keys())
+
+            for key in possible_keys:
+                if key in available_keys:
+                    volume = data[key].astype(np.float32)
+                    break
+            if volume is None:
+                for key in available_keys:
+                    if not key.startswith('__'):  # Skip metadata keys
+                        volume = data[key].astype(np.float32)
+                        print(f"Using fallback key '{key}' for {series_id}")
+                        break
+            if volume is None:
+                print(f"No valid data key found in {series_id}. Available keys: {available_keys}")
+                return np.zeros((3, 128, 256, 256), dtype=np.float32), np.zeros(14, dtype=np.float32)
 
             # Handle different shapes
             if volume.ndim == 3:  # (D, H, W)
