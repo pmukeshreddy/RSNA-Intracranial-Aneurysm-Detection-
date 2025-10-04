@@ -7,7 +7,6 @@ import os
 from typing import Tuple, Optional
 from tqdm import tqdm
 
-# Define label columns
 LABEL_COLS = [
     'Left Infraclinoid Internal Carotid Artery',
     'Right Infraclinoid Internal Carotid Artery',
@@ -25,11 +24,10 @@ LABEL_COLS = [
     'Aneurysm Present'
 ]
 
-class Aneurysm2_5DDataset(Dataset):
+class Aneurysm3DDataset(Dataset):
     """
-    Dataset for 2.5D preprocessed DICOM stacks.
-    Expects .npy files with shape (num_stacks, channels, H, W)
-    Data is already normalized to [0,1] from preprocessing pipeline.
+    Dataset for 3D volumes from 2.5D preprocessed stacks.
+    Converts (D, 3, H, W) -> (3, 64, 128, 128) for 3D CNNs.
     """
     
     def __init__(
@@ -40,26 +38,16 @@ class Aneurysm2_5DDataset(Dataset):
         is_training: bool = True,
         cache_data: bool = False,
         transform: Optional[callable] = None,
-        stack_selection: str = 'middle'  # 'middle', 'random', or 'all'
+        channel_mode: str = 'average'  # 'average', 'first', or 'max'
     ):
-        """
-        Args:
-            npy_dir: Directory containing .npy files
-            train_df: DataFrame with SeriesInstanceUID and labels
-            fold: Fold number for validation
-            is_training: If True, use all folds except `fold`
-            cache_data: If True, cache all data in memory
-            transform: Optional transform to apply
-            stack_selection: How to select from multiple stacks ('middle', 'random', 'all')
-        """
         self.npy_dir = Path(npy_dir)
         self.transform = transform
         self.cache_data = cache_data
         self.cache = {}
         self.is_training = is_training
-        self.stack_selection = stack_selection
+        self.channel_mode = channel_mode
 
-        print("🔍 Building file index...")
+        print("Building file index...")
         self.file_mapping = {}
 
         for root, dirs, files in os.walk(self.npy_dir):
@@ -71,98 +59,124 @@ class Aneurysm2_5DDataset(Dataset):
 
         print(f"   Found {len(self.file_mapping)} .npy files")
 
-        # Split data
         if is_training:
             self.df = train_df[train_df['fold'] != fold].reset_index(drop=True)
-            print(f"   Training mode: using all folds except fold {fold}")
         else:
             self.df = train_df[train_df['fold'] == fold].reset_index(drop=True)
-            print(f"   Validation mode: using fold {fold}")
 
-        # Filter for available files
         available_series = set(self.file_mapping.keys())
         self.df = self.df[self.df['SeriesInstanceUID'].isin(available_series)].reset_index(drop=True)
         
-        print(f"   ✅ Dataset size: {len(self.df)} samples")
+        print(f"   Dataset size: {len(self.df)} samples")
 
-        # Cache data if requested
         if cache_data:
-            print("\n💾 Caching data in memory...")
+            print("Caching data in memory...")
             for idx in tqdm(range(len(self.df)), desc="   Caching"):
                 self._load_data(idx)
-            print("   ✅ Caching complete!")
 
     def __len__(self) -> int:
         return len(self.df)
 
     def _load_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Load and process a single sample."""
         series_id = self.df.iloc[idx]['SeriesInstanceUID']
 
-        # Check cache
         if series_id in self.cache:
             return self.cache[series_id]
 
         npy_path = self.file_mapping.get(series_id)
         if npy_path is None:
-            print(f"⚠️ File not found: {series_id}")
-            # Return zeros with expected shape (channels, H, W)
-            first_file = next(iter(self.file_mapping.values()))
-            dummy_shape = np.load(first_file).shape[1:]  # (channels, H, W)
-            return np.zeros(dummy_shape, dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
+            print(f"File not found: {series_id}")
+            return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
 
         try:
-            # Load 2.5D stacks: shape (num_stacks, channels, H, W)
+            # Load: shape (D, 3, H, W)
             stacks = np.load(npy_path).astype(np.float32)
             
-            # Validate shape
             if stacks.ndim != 4:
-                print(f"⚠️ Unexpected shape {stacks.shape} for {series_id}, expected (N, C, H, W)")
-                dummy_shape = (stacks.shape[1], stacks.shape[2], stacks.shape[3]) if stacks.ndim == 4 else (3, 256, 256)
-                return np.zeros(dummy_shape, dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
+                print(f"Unexpected shape {stacks.shape} for {series_id}, expected (D, 3, H, W)")
+                return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
             
-            num_stacks = stacks.shape[0]
-            
-            # Select stack based on strategy
-            if self.stack_selection == 'middle' or num_stacks == 1:
-                selected_stack = stacks[num_stacks // 2]
-            elif self.stack_selection == 'random' and self.is_training:
-                selected_stack = stacks[np.random.randint(0, num_stacks)]
-            elif self.stack_selection == 'all':
-                # Return all stacks (for inference/ensemble)
-                selected_stack = stacks  # Shape: (num_stacks, channels, H, W)
+            # Collapse 3 channels per slice into single depth volume
+            if self.channel_mode == 'average':
+                volume = stacks.mean(axis=1)  # (D, H, W)
+            elif self.channel_mode == 'first':
+                volume = stacks[:, 0, :, :]  # (D, H, W)
+            elif self.channel_mode == 'max':
+                volume = stacks.max(axis=1)  # (D, H, W)
             else:
-                selected_stack = stacks[num_stacks // 2]
+                volume = stacks.mean(axis=1)
+            
+            # Replicate to 3 channels for model: (3, D, H, W)
+            volume = np.stack([volume, volume, volume], axis=0)
+            
+            # Resize to target: (3, 64, 128, 128)
+            volume = self._resize_volume(volume, target_size=(64, 128, 128))
             
             # Get labels
             labels = self.df.iloc[idx][LABEL_COLS].values.astype(np.float32)
 
-            # Cache if enabled
             if self.cache_data:
-                self.cache[series_id] = (selected_stack, labels)
+                self.cache[series_id] = (volume, labels)
 
-            return selected_stack, labels
+            return volume, labels
 
         except Exception as e:
-            print(f"❌ Error loading {series_id}: {e}")
+            print(f"Error loading {series_id}: {e}")
             import traceback
             traceback.print_exc()
-            # Return zeros with expected shape
-            try:
-                first_file = next(iter(self.file_mapping.values()))
-                dummy_shape = np.load(first_file).shape[1:]  # (channels, H, W)
-            except:
-                dummy_shape = (3, 256, 256)  # Fallback
-            return np.zeros(dummy_shape, dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
+            return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(len(LABEL_COLS), dtype=np.float32)
+
+    def _resize_volume(self, volume, target_size=(64, 128, 128)):
+        """Resize volume to target size (D, H, W)"""
+        C, D, H, W = volume.shape
+        target_d, target_h, target_w = target_size
+
+        # Depth
+        if D != target_d:
+            if D > target_d:
+                start_idx = (D - target_d) // 2
+                volume = volume[:, start_idx:start_idx + target_d, :, :]
+            else:
+                pad_needed = target_d - D
+                pad_before = pad_needed // 2
+                pad_after = pad_needed - pad_before
+                volume = np.pad(volume, ((0, 0), (pad_before, pad_after), (0, 0), (0, 0)),
+                              mode='constant', constant_values=0)
+
+        # Height
+        C, D, H, W = volume.shape
+        if H != target_h:
+            if H > target_h:
+                start_idx = (H - target_h) // 2
+                volume = volume[:, :, start_idx:start_idx + target_h, :]
+            else:
+                pad_needed = target_h - H
+                pad_before = pad_needed // 2
+                pad_after = pad_needed - pad_before
+                volume = np.pad(volume, ((0, 0), (0, 0), (pad_before, pad_after), (0, 0)),
+                              mode='constant', constant_values=0)
+
+        # Width
+        C, D, H, W = volume.shape
+        if W != target_w:
+            if W > target_w:
+                start_idx = (W - target_w) // 2
+                volume = volume[:, :, :, start_idx:start_idx + target_w]
+            else:
+                pad_needed = target_w - W
+                pad_before = pad_needed // 2
+                pad_after = pad_needed - pad_before
+                volume = np.pad(volume, ((0, 0), (0, 0), (0, 0), (pad_before, pad_after)),
+                              mode='constant', constant_values=0)
+
+        return volume
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single sample."""
         volume, labels = self._load_data(idx)
 
         X = torch.tensor(volume, dtype=torch.float32)
         Y = torch.tensor(labels, dtype=torch.float32)
 
-        # Apply transforms (only during training)
         if self.transform and self.is_training:
             X = self.transform(X)
 
@@ -170,7 +184,6 @@ class Aneurysm2_5DDataset(Dataset):
 
 
 def custom_collate_fn(batch):
-    """Custom collate function for batching."""
     images = []
     labels = []
 
