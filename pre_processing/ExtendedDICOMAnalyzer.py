@@ -17,44 +17,55 @@ class ExtendedDICOMAnalyzer:
         self.series_info = defaultdict(list)
         self.labels_df = None
         
-    def analyze_series_structure(self):
-        """Analyze series-level structure: slices, spacing, etc."""
+    def analyze_series_structure(self, sample_series=500):
         print("\n🔬 ANALYZING SERIES STRUCTURE...")
         print("-" * 60)
         
         all_files = list(self.data_dir.rglob('*.dcm'))
+        print(f"📂 Sampling {sample_series} series from {len(all_files)} files...")
         
-        # Group files by SeriesInstanceUID
+        series_encountered = set()
         series_groups = defaultdict(list)
+        np.random.shuffle(all_files)
         
-        print("📂 Grouping files by series...")
-        for file_path in tqdm(all_files, desc="Reading series info"):
+        pbar = tqdm(total=sample_series, desc="📊 Collecting series")
+        
+        for file_path in all_files:
+            if len(series_encountered) >= sample_series:
+                break
+            
             try:
                 dcm = pydicom.dcmread(file_path, stop_before_pixels=True)
                 series_uid = dcm.SeriesInstanceUID
                 
-                series_groups[series_uid].append({
-                    'path': str(file_path),
-                    'instance_num': int(getattr(dcm, 'InstanceNumber', 0)),
-                    'slice_location': float(getattr(dcm, 'SliceLocation', 0.0)),
-                    'slice_thickness': float(getattr(dcm, 'SliceThickness', 0.0)),
-                    'pixel_spacing': getattr(dcm, 'PixelSpacing', [0, 0]),
-                    'modality': getattr(dcm, 'Modality', 'Unknown')
-                })
-            except Exception as e:
-                continue
+                if series_uid not in series_encountered or len(series_groups[series_uid]) < 200:
+                    series_groups[series_uid].append({
+                        'path': str(file_path),
+                        'instance_num': int(getattr(dcm, 'InstanceNumber', 0)),
+                        'slice_location': float(getattr(dcm, 'SliceLocation', 0.0)),
+                        'slice_thickness': float(getattr(dcm, 'SliceThickness', 0.0)),
+                        'pixel_spacing': getattr(dcm, 'PixelSpacing', [0, 0]),
+                        'modality': getattr(dcm, 'Modality', 'Unknown')
+                    })
+                    
+                    if series_uid not in series_encountered and len(series_groups[series_uid]) > 5:
+                        series_encountered.add(series_uid)
+                        pbar.update(1)
+            except:
+                pass
         
-        # Analyze each series
+        pbar.close()
+        
+        # Rest of the method continues...
         series_stats = []
         
-        print(f"\n📊 Analyzing {len(series_groups)} unique series...")
+        print(f"\n📊 Analyzing {len(series_groups)} sampled series...")
         for series_uid, slices in tqdm(series_groups.items(), desc="Computing stats"):
             slices_sorted = sorted(slices, key=lambda x: x['slice_location'])
             
             num_slices = len(slices_sorted)
             modality = slices_sorted[0]['modality']
             
-            # Calculate slice spacing
             if num_slices > 1:
                 locations = [s['slice_location'] for s in slices_sorted]
                 spacings = np.diff(locations)
@@ -89,6 +100,12 @@ class ExtendedDICOMAnalyzer:
             })
         
         self.series_df = pd.DataFrame(series_stats)
+    
+    # Print summary (rest of the code stays the same)
+              
+      
+            
+            
         
         # Print summary
         print("\n" + "="*60)
@@ -470,7 +487,7 @@ class ExtendedDICOMAnalyzer:
 
 # ==================== USAGE ====================
 if __name__ == "__main__":
-    DATA_DIR = '/kaggle/input/rsna-intracranial-aneurysm-detection/train'
+    DATA_DIR = '/kaggle/input/rsna-intracranial-aneurysm-detection/series'
     TRAIN_CSV = '/kaggle/input/rsna-intracranial-aneurysm-detection/train.csv'
     
     analyzer = ExtendedDICOMAnalyzer(DATA_DIR, TRAIN_CSV)
@@ -478,8 +495,8 @@ if __name__ == "__main__":
     # Run all analyses
     print("🚀 Running Extended Analysis Pipeline...\n")
     
-    # 1. Series structure
-    series_df = analyzer.analyze_series_structure()
+    # 1. Series structure (sample 500 series instead of all)
+    series_df = analyzer.analyze_series_structure(sample_series=500)
     
     # 2. Label distribution
     label_stats = analyzer.analyze_labels()
