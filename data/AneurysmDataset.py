@@ -1,286 +1,295 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import List, Optional, Dict, Tuple
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
 class AneurysmDataset(Dataset):
-    def __init__(self, npz_dir, train_df, fold, is_training, use_2d, slice_selection, cache_data, transform=None):
-        self.npz_dir = Path(npz_dir)
-        self.use_2d = use_2d
-        self.slice_selection = slice_selection
+    """
+    Dataset for preprocessed aneurysm detection data
+    Handles .npz files across multiple folders (part1, part2, part3, etc.)
+    """
+    
+    def __init__(
+        self,
+        train_df: pd.DataFrame,
+        data_folders: List[str],
+        label_cols: List[str],
+        transform=None,
+        mode: str = 'train',
+        cache_data: bool = False,
+        max_slices: int = 64
+    ):
+        """
+        Args:
+            train_df: DataFrame with SeriesInstanceUID and labels
+            data_folders: List of paths to folders containing .npz files
+            label_cols: List of label column names
+            transform: Albumentations transforms (optional)
+            mode: 'train' or 'val'
+            cache_data: Whether to cache loaded data in memory
+            max_slices: Maximum number of slices to use (for memory efficiency)
+        """
+        self.train_df = train_df.reset_index(drop=True)
+        self.data_folders = [Path(f) for f in data_folders]
+        self.label_cols = label_cols
         self.transform = transform
+        self.mode = mode
         self.cache_data = cache_data
-        self.cache = {}
-        self.is_training = is_training
-
-        # Create a mapping of series_id to full file path
-        print("Building file index...")
-        self.file_mapping = {}
-        for root, dirs, files in os.walk(self.npz_dir):
-            for f in files:
-                if f.endswith('.npz'):
-                    series_id = f.replace('.npz', '')
-                    self.file_mapping[series_id] = Path(root) / f
-
-        print(f"Found {len(self.file_mapping)} .npz files")
-
-        if is_training:
-            self.df = train_df[train_df['fold'] != fold].reset_index(drop=True)
-        else:
-            self.df = train_df[train_df['fold'] == fold].reset_index(drop=True)
-
-        # Filter dataframe to only include available files
-        available_series = set(self.file_mapping.keys())
-        self.df = self.df[self.df['SeriesInstanceUID'].isin(available_series)].reset_index(drop=True)
-
-        print(f"Dataset size after filtering: {len(self.df)} samples")
-
-        if cache_data:
-            print("Caching all data in memory...")
-            for idx in tqdm(range(len(self.df))):
-                self._load_data(idx)
-
+        self.max_slices = max_slices
+        
+        # Build file path mapping
+        self.file_map = self._build_file_map()
+        
+        # Filter df to only include series we have files for
+        available_series = set(self.file_map.keys())
+        self.train_df = self.train_df[
+            self.train_df['SeriesInstanceUID'].isin(available_series)
+        ].reset_index(drop=True)
+        
+        print(f"Initialized {mode} dataset:")
+        print(f"  Total samples: {len(self.train_df)}")
+        print(f"  Aneurysm positive: {self.train_df['Aneurysm Present'].sum()}")
+        print(f"  Aneurysm rate: {self.train_df['Aneurysm Present'].mean():.2%}")
+        
+        # Optional: cache data in memory
+        self.cache = {} if cache_data else None
+        
+    def _build_file_map(self) -> Dict[str, Path]:
+        """Build mapping from SeriesInstanceUID to .npz file path"""
+        file_map = {}
+        
+        for folder in self.data_folders:
+            if not folder.exists():
+                print(f"Warning: Folder not found: {folder}")
+                continue
+                
+            npz_files = list(folder.glob("*.npz"))
+            print(f"Found {len(npz_files)} files in {folder.name}")
+            
+            for npz_file in npz_files:
+                series_id = npz_file.stem  # filename without .npz extension
+                file_map[series_id] = npz_file
+        
+        print(f"Total mapped files: {len(file_map)}")
+        return file_map
+    
     def __len__(self) -> int:
-        return len(self.df)
-
-    def _load_data(self, idx):
-        series_id = self.df.iloc[idx]['SeriesInstanceUID']
-
-        if series_id in self.cache:
-            return self.cache[series_id]
-
-        # Get file path from mapping
-        npz_path = self.file_mapping.get(series_id)
-
-        if npz_path is None:
-            print(f"File not found in mapping: {series_id}")
-            return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(14, dtype=np.float32)
-
-        try:
-            data = np.load(npz_path, allow_pickle=True)
-
-            # Get volume - try different possible keys
-            possible_keys = ['volume', 'final_input', 'data', 'image', 'array']
-            volume = None
-            available_keys = list(data.keys())
-
-            for key in possible_keys:
-                if key in available_keys:
-                    volume = data[key]
-                    break
-
-            if volume is None:
-                for key in available_keys:
-                    if not key.startswith('__'):  # Skip metadata keys
-                        volume = data[key]
-                        print(f"Using fallback key '{key}' for {series_id}")
-                        break
-
-            if volume is None:
-                print(f"No valid data key found in {series_id}. Available keys: {available_keys}")
-                return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(14, dtype=np.float32)
-
-            # Ensure float32 for processing
-            volume = volume.astype(np.float32)
-
-            # Handle 3D volume (D, H, W) - no channel dimension yet
-            if volume.ndim == 3:
-                pass  # This is expected
-            elif volume.ndim == 4:
-                # If already has channels, take first channel
-                if volume.shape[0] <= 3:
-                    volume = volume[0]
-                else:
-                    volume = volume[0]
-            else:
-                print(f"Unexpected volume shape: {volume.shape}")
-                return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(14, dtype=np.float32)
-
-            # DATA IS ALREADY NORMALIZED [0,1] - CREATE VARIETY BETWEEN CHANNELS
-            # Check if data is normalized
-            if volume.min() >= 0 and volume.max() <= 1.0:
-                # Data is normalized, create different views for diversity
-                
-                # Channel 1: Original normalized data
-                channel1 = volume
-                
-                # Channel 2: Enhanced contrast (stretch middle values)
-                channel2 = np.clip(volume * 1.5 - 0.25, 0, 1)
-                
-                # Channel 3: Emphasis on bright regions (squared for contrast)
-                channel3 = volume ** 2
-                
-                # Add slight random augmentation during training
-                if self.is_training:
-                    noise_factor = 0.02
-                    channel1 = channel1 + np.random.normal(0, noise_factor, channel1.shape)
-                    channel1 = np.clip(channel1, 0, 1)
-                
-            else:
-                # Data is in HU units, apply standard windowing
-                print(f"Data appears to be in HU units: [{volume.min():.1f}, {volume.max():.1f}]")
-                
-                # Brain window
-                brain_window = np.clip(volume, -100, 300)
-                channel1 = (brain_window + 100) / 400
-                
-                # Vessel window
-                vessel_window = np.clip(volume, 40, 400)
-                channel2 = (vessel_window - 40) / 360
-                
-                # Bone window
-                bone_window = np.clip(volume, 200, 700)
-                channel3 = (bone_window - 200) / 500
-
-            # Stack as channels (3, D, H, W)
-            volume = np.stack([channel1, channel2, channel3], axis=0)
-
-            # Get labels
-            labels = self.df.iloc[idx][LABEL_COLS].values.astype(np.float32)
-
-            # Cache if enabled
-            if self.cache_data:
-                self.cache[series_id] = (volume, labels)
-
-            return volume, labels
-
-        except Exception as e:
-            print(f"Error loading {series_id} from {npz_path}: {e}")
-            return np.zeros((3, 64, 128, 128), dtype=np.float32), np.zeros(14, dtype=np.float32)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Load data
-        volume, labels = self._load_data(idx)
-
-        # Handle 2D vs 3D processing
-        if self.use_2d:
-            if volume.ndim == 4:
-                volume = self._extract_slice(volume)
+        return len(self.train_df)
+    
+    def _load_npz(self, series_id: str) -> Tuple[np.ndarray, Dict]:
+        """Load .npz file and return image data + metadata"""
+        npz_path = self.file_map[series_id]
+        
+        with np.load(npz_path) as data:
+            image_data = data['image_data']  # (3, D, H, W)
+            modality = str(data['modality'])
+            spacing = data['spacing']
+        
+        return image_data, {'modality': modality, 'spacing': spacing}
+    
+    def _process_volume(self, volume: np.ndarray) -> np.ndarray:
+        """
+        Process volume to fixed size
+        Input: (3, D, H, W)
+        Output: (3, max_slices, H, W)
+        """
+        C, D, H, W = volume.shape
+        
+        # Handle depth dimension
+        if D > self.max_slices:
+            # Sample evenly spaced slices
+            indices = np.linspace(0, D-1, self.max_slices, dtype=int)
+            volume = volume[:, indices, :, :]
+        elif D < self.max_slices:
+            # Pad with zeros
+            pad_size = self.max_slices - D
+            volume = np.pad(
+                volume, 
+                ((0, 0), (0, pad_size), (0, 0), (0, 0)), 
+                mode='constant'
+            )
+        
+        return volume
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        row = self.train_df.iloc[idx]
+        series_id = row['SeriesInstanceUID']
+        
+        # Check cache first
+        if self.cache is not None and series_id in self.cache:
+            volume, metadata = self.cache[series_id]
         else:
-            # Handle variable sizes for 3D - resize ALL dimensions
-            if volume.ndim == 4 and volume.shape[0] == 3:
-                C, D, H, W = volume.shape
-                target_depth = 64
-                target_height = 128
-                target_width = 128
+            volume, metadata = self._load_npz(series_id)
+            
+            if self.cache is not None:
+                self.cache[series_id] = (volume, metadata)
+        
+        # Process volume to fixed size
+        volume = self._process_volume(volume)  # (3, max_slices, H, W)
+        
+        # Apply transforms if in train mode
+        if self.transform and self.mode == 'train':
+            # Apply 2D transforms to each slice
+            C, D, H, W = volume.shape
+            transformed_slices = []
+            
+            for c in range(C):
+                channel_slices = []
+                for d in range(D):
+                    slice_2d = volume[c, d, :, :]  # (H, W)
+                    
+                    # Albumentations expects (H, W, C) for images
+                    # We'll treat each slice as single-channel
+                    transformed = self.transform(image=slice_2d[..., np.newaxis])
+                    channel_slices.append(transformed['image'].squeeze())
+                
+                transformed_slices.append(np.stack(channel_slices))
+            
+            volume = np.stack(transformed_slices)
+        
+        # Convert to torch tensor
+        volume = torch.from_numpy(volume).float()
+        
+        # Get labels
+        labels = torch.tensor(
+            row[self.label_cols].values.astype(np.float32)
+        )
+        
+        return {
+            'image': volume,  # (3, max_slices, H, W)
+            'labels': labels,  # (num_labels,)
+            'series_id': series_id,
+            'modality': metadata['modality']
+        }
 
-                # Handle Depth dimension
-                if D != target_depth:
-                    if D > target_depth:
-                        # Crop: take center slices
-                        start_idx = (D - target_depth) // 2
-                        volume = volume[:, start_idx:start_idx + target_depth, :, :]
-                    else:
-                        # Pad: add zeros to reach target depth
-                        pad_needed = target_depth - D
-                        pad_before = pad_needed // 2
-                        pad_after = pad_needed - pad_before
-                        volume = np.pad(
-                            volume,
-                            ((0, 0), (pad_before, pad_after), (0, 0), (0, 0)),
-                            mode='constant',
-                            constant_values=0
-                        )
 
-                # Update dimensions after depth processing
-                C, D, H, W = volume.shape
+# Data augmentation transforms
+def get_train_transforms():
+    """Training augmentations for 2D slices"""
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(
+            shift_limit=0.05,
+            scale_limit=0.1,
+            rotate_limit=15,
+            p=0.5
+        ),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.2,
+            contrast_limit=0.2,
+            p=0.5
+        ),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
+    ])
 
-                # Handle Height dimension
-                if H != target_height:
-                    if H > target_height:
-                        # Crop: take center
-                        start_idx = (H - target_height) // 2
-                        volume = volume[:, :, start_idx:start_idx + target_height, :]
-                    else:
-                        # Pad: add zeros
-                        pad_needed = target_height - H
-                        pad_before = pad_needed // 2
-                        pad_after = pad_needed - pad_before
-                        volume = np.pad(
-                            volume,
-                            ((0, 0), (0, 0), (pad_before, pad_after), (0, 0)),
-                            mode='constant',
-                            constant_values=0
-                        )
+def get_val_transforms():
+    """Validation transforms (none, just for consistency)"""
+    return None
 
-                # Update dimensions after height processing
-                C, D, H, W = volume.shape
 
-                # Handle Width dimension
-                if W != target_width:
-                    if W > target_width:
-                        # Crop: take center
-                        start_idx = (W - target_width) // 2
-                        volume = volume[:, :, :, start_idx:start_idx + target_width]
-                    else:
-                        # Pad: add zeros
-                        pad_needed = target_width - W
-                        pad_before = pad_needed // 2
-                        pad_after = pad_needed - pad_before
-                        volume = np.pad(
-                            volume,
-                            ((0, 0), (0, 0), (0, 0), (pad_before, pad_after)),
-                            mode='constant',
-                            constant_values=0
-                        )
+# Example usage
+def create_dataloaders(
+    train_df: pd.DataFrame,
+    data_folders: List[str],
+    label_cols: List[str],
+    fold: int = 0,
+    batch_size: int = 4,
+    num_workers: int = 4
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train and validation dataloaders for a specific fold
+    """
+    
+    # Split by fold
+    train_df_fold = train_df[train_df['fold'] != fold].reset_index(drop=True)
+    val_df_fold = train_df[train_df['fold'] == fold].reset_index(drop=True)
+    
+    # Create datasets
+    train_dataset = AneurysmDataset(
+        train_df=train_df_fold,
+        data_folders=data_folders,
+        label_cols=label_cols,
+        transform=get_train_transforms(),
+        mode='train',
+        cache_data=False,  # Set True if you have enough RAM
+        max_slices=64
+    )
+    
+    val_dataset = AneurysmDataset(
+        train_df=val_df_fold,
+        data_folders=data_folders,
+        label_cols=label_cols,
+        transform=get_val_transforms(),
+        mode='val',
+        cache_data=False,
+        max_slices=64
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
 
-            else:
-                # Fallback: force resize to expected size
-                print(f"Warning: Unexpected shape at index {idx}, forcing resize")
-                temp_tensor = torch.tensor(volume, dtype=torch.float32)
-                if temp_tensor.ndim == 3:
-                    temp_tensor = temp_tensor.unsqueeze(0)
-                if temp_tensor.ndim == 4:
-                    if temp_tensor.shape[0] < 3:
-                        padding = torch.zeros(3 - temp_tensor.shape[0], *temp_tensor.shape[1:], dtype=torch.float32)
-                        temp_tensor = torch.cat([temp_tensor, padding], dim=0)
-                    elif temp_tensor.shape[0] > 3:
-                        temp_tensor = temp_tensor[:3]
 
-                    temp_tensor = temp_tensor.unsqueeze(0)
-                    temp_tensor = torch.nn.functional.interpolate(
-                        temp_tensor, size=(64,128,128), mode='trilinear', align_corners=False
-                    )
-                    volume = temp_tensor.squeeze(0).numpy()
-
-        # Clean tensor creation
-        volume_array = np.array(volume, dtype=np.float32, copy=True)
-        labels_array = np.array(labels, dtype=np.float32, copy=True)
-
-        X = torch.tensor(volume_array, dtype=torch.float32)
-        Y = torch.tensor(labels_array, dtype=torch.float32)
-
-        # Verify final shape for 3D
-        if not self.use_2d:
-            if X.shape != (3, 64,128,128):
-                print(f"Shape mismatch at index {idx}: {X.shape}")
-                X = X.unsqueeze(0)
-                X = torch.nn.functional.interpolate(
-                    X, size=(64,128,128), mode='trilinear', align_corners=False
-                )
-                X = X.squeeze(0)
-
-        # Apply transforms if needed
-        if self.transform:
-            X = self.transform(X)
-
-        return X, Y
-
-    def _extract_slice(self, volume: np.ndarray) -> np.ndarray:
-        """Extract 2D slice(s) from 3D volume"""
-        n_channels, n_slices, height, width = volume.shape
-
-        if self.slice_selection == 'middle':
-            slice_idx = n_slices // 2
-            return volume[:, slice_idx, :, :]
-
-        elif self.slice_selection == 'random':
-            if hasattr(self, 'df'):
-                slice_idx = random.randint(n_slices//4, 3*n_slices//4)
-            else:
-                slice_idx = n_slices // 2
-            return volume[:, slice_idx, :, :]
-
-        elif self.slice_selection == 'all':
-            return volume.transpose(1, 0, 2, 3)
-
-        elif self.slice_selection == 'mip':
-            return np.max(volume, axis=1)
-
-        else:
-            raise ValueError(f"Unknown slice_selection: {self.slice_selection}")
+# Example usage:
+if __name__ == "__main__":
+    # Your data folders (update paths)
+    data_folders = [
+        '/path/to/part1',
+        '/path/to/part2', 
+        '/path/to/part3'
+    ]
+    
+    # Label columns from your notebook
+    label_cols = [
+        'Left Infraclinoid Internal Carotid Artery',
+        'Right Infraclinoid Internal Carotid Artery',
+        'Left Supraclinoid Internal Carotid Artery',
+        'Right Supraclinoid Internal Carotid Artery',
+        'Left Middle Cerebral Artery',
+        'Right Middle Cerebral Artery',
+        'Anterior Communicating Artery',
+        'Left Anterior Cerebral Artery',
+        'Right Anterior Cerebral Artery',
+        'Left Posterior Communicating Artery',
+        'Right Posterior Communicating Artery',
+        'Basilar Tip',
+        'Other Posterior Circulation',
+        'Aneurysm Present'
+    ]
+    
+    # Create dataloaders for fold 0
+    train_loader, val_loader = create_dataloaders(
+        train_df=train_df_with_folds,  # Your df with folds
+        data_folders=data_folders,
+        label_cols=label_cols,
+        fold=0,
+        batch_size=4,
+        num_workers=4
+    )
+    
+    # Test loading
+    for batch in train_loader:
+        print(f"Image shape: {batch['image'].shape}")  # (B, 3, 64, H, W)
+        print(f"Labels shape: {batch['labels'].shape}")  # (B, 14)
+        print(f"Modality: {batch['modality']}")
+        break
